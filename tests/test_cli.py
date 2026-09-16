@@ -103,6 +103,48 @@ class TestCLI:
         assert out_file.read_text(encoding="utf-8").strip() == "saved text"
         assert "Transcript written" in capsys.readouterr().out
 
+    def test_transcribe_provider_fallback_requires_explicit_flag(self):
+        with patch(
+            "agent_reach.transcribe.transcribe",
+            return_value="hello transcript",
+        ) as mock_transcribe:
+            with patch(
+                "sys.argv",
+                [
+                    "agent-reach",
+                    "transcribe",
+                    "audio.mp3",
+                    "--allow-provider-fallback",
+                ],
+            ):
+                main()
+
+        mock_transcribe.assert_called_once_with(
+            "audio.mp3",
+            provider="auto",
+            allow_provider_fallback=True,
+        )
+
+    def test_transcribe_provider_fallback_rejects_explicit_provider(self, capsys):
+        with patch("agent_reach.transcribe.transcribe") as mock_transcribe:
+            with patch(
+                "sys.argv",
+                [
+                    "agent-reach",
+                    "transcribe",
+                    "audio.mp3",
+                    "--provider",
+                    "groq",
+                    "--allow-provider-fallback",
+                ],
+            ):
+                with pytest.raises(SystemExit) as exc_info:
+                    main()
+
+        assert exc_info.value.code == 2
+        assert "requires --provider auto" in capsys.readouterr().err
+        mock_transcribe.assert_not_called()
+
     def test_parse_twitter_cookie_input_separate_values(self):
         auth_token, ct0 = cli._parse_twitter_cookie_input("token123 ct0abc")
         assert auth_token == "token123"
@@ -166,8 +208,73 @@ class TestCLI:
         cli._install_rdt_cli()
 
         out = capsys.readouterr().out
-        assert commands == [["pipx", "install", cli._RDT_GIT_SOURCE]]
+        assert commands == [["/usr/local/bin/pipx", "install", cli._RDT_GIT_SOURCE]]
         assert "✅ rdt-cli installed" in out
+
+    def test_install_boss_deps_pins_pr_commit_with_pipx(self, monkeypatch, capsys):
+        state = {"boss_installed": False}
+        commands = []
+
+        def fake_which(name):
+            if name == "boss":
+                return "/usr/local/bin/boss" if state["boss_installed"] else None
+            if name == "pipx":
+                return "/usr/local/bin/pipx"
+            return None
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            state["boss_installed"] = True
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(shutil, "which", fake_which)
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert cli._install_boss_deps() is True
+
+        assert commands == [
+            [
+                "/usr/local/bin/pipx",
+                "install",
+                "--force",
+                cli._BOSS_AGENT_CLI_SOURCE,
+            ]
+        ]
+        assert cli._BOSS_AGENT_CLI_PR_COMMIT in cli._BOSS_AGENT_CLI_SOURCE
+        assert cli._BOSS_AGENT_CLI_PR_COMMIT == "4c991b77086a203173bf08a4cb64a23af6514fe6"
+        assert "can4hou6joeng4/boss-agent-cli" in cli._BOSS_AGENT_CLI_SOURCE
+        assert "iqjiy" not in cli._BOSS_AGENT_CLI_SOURCE
+        assert "boss-agent-cli upstream pinned commit" in capsys.readouterr().out
+
+    def test_install_boss_deps_falls_back_to_uv(self, monkeypatch):
+        state = {"boss_installed": False}
+        commands = []
+
+        def fake_which(name):
+            if name == "boss":
+                return "/usr/local/bin/boss" if state["boss_installed"] else None
+            if name == "uv":
+                return "/usr/local/bin/uv"
+            return None
+
+        def fake_run(cmd, **kwargs):
+            commands.append(cmd)
+            state["boss_installed"] = True
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        monkeypatch.setattr(shutil, "which", fake_which)
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        assert cli._install_boss_deps() is True
+        assert commands == [
+            [
+                "/usr/local/bin/uv",
+                "tool",
+                "install",
+                "--force",
+                cli._BOSS_AGENT_CLI_SOURCE,
+            ]
+        ]
 
     def test_install_reddit_deps_routes_by_environment(self, monkeypatch):
         """桌面 → OpenCLI;服务器 → rdt-cli(钉 git 源)。"""
@@ -184,6 +291,35 @@ class TestCLI:
         monkeypatch.setattr(cli, "_detect_environment", lambda: "server")
         cli._install_reddit_deps()
         assert calls == ["rdt"]
+
+    def test_install_opencli_uses_resolved_windows_npm_path(self, monkeypatch):
+        import agent_reach.backends as backends
+        from agent_reach.backends import OpenCLIStatus
+
+        statuses = iter(
+            [
+                OpenCLIStatus(installed=False),
+                OpenCLIStatus(installed=True, extension_connected=False),
+            ]
+        )
+        calls = []
+        monkeypatch.setattr(backends, "opencli_status", lambda: next(statuses))
+        monkeypatch.setattr(
+            shutil,
+            "which",
+            lambda name: "C:/Tools/npm.CMD" if name == "npm" else None,
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda args, **_kwargs: calls.append(args)
+            or subprocess.CompletedProcess(args, 0, "", ""),
+        )
+
+        assert cli._install_opencli_deps() is True
+        assert calls == [
+            ["C:/Tools/npm.CMD", "install", "-g", backends.OPENCLI_PACKAGE]
+        ]
 
     def test_install_facebook_instagram_routes_to_opencli_once(self, monkeypatch, capsys):
         calls = []
@@ -212,6 +348,7 @@ class TestCLI:
             Namespace(
                 env="auto",
                 proxy="",
+                system=True,
                 safe=False,
                 dry_run=False,
                 channels="facebook,instagram,opencli",
@@ -228,16 +365,17 @@ class TestCLI:
             Namespace(
                 env="server",
                 proxy="",
+                system=True,
                 safe=False,
                 dry_run=True,
-                channels="facebook,instagram,opencli,bilibili",
+                channels="facebook,instagram,opencli,boss,bilibili",
             )
         )
 
         out = capsys.readouterr().out
-        assert "服务器环境跳过：facebook, instagram, opencli" in out
+        assert "服务器环境跳过：boss, facebook, instagram, opencli" in out
         assert "[dry-run] Would install optional channels: bilibili" in out
-        assert "facebook, instagram, opencli, bilibili" not in out
+        assert "boss, facebook, instagram, opencli, bilibili" not in out
 
 
 class TestCheckUpdateRetry:
